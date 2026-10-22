@@ -1,0 +1,10 @@
+*.exe
+*.dll
+*.pdb
+bin/
+obj/
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
