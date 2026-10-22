@@ -11,12 +11,12 @@ if not exist "%CSC%" (
   exit /b 1
 )
 
-"%CSC%" /nologo /utf8output /target:winexe /out:"G49电量助手.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll "G49电量助手.cs"
+"%CSC%" /nologo /utf8output /target:winexe /out:"红龙G49 PRO鼠标电量助手.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll "G49电量助手.cs"
 if errorlevel 1 (
   echo 编译失败。
   pause
   exit /b 1
 )
 
-echo 编译完成：%CD%\G49电量助手.exe
+echo 编译完成：%CD%\红龙G49 PRO鼠标电量助手.exe
 pause

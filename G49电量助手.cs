@@ -21,7 +21,7 @@ internal static class Program
         {
             if (!firstInstance)
             {
-                MessageBox.Show("G49 鼠标电量助手已经在运行。", "G49 鼠标电量",
+                MessageBox.Show("红龙G49 PRO鼠标电量助手已经在运行。", "红龙G49 PRO鼠标电量助手",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -147,7 +147,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             startupItem.CheckedChanged -= StartupItem_CheckedChanged;
             startupItem.Checked = !startupItem.Checked;
             startupItem.CheckedChanged += StartupItem_CheckedChanged;
-            trayIcon.ShowBalloonTip(3500, "G49 鼠标电量",
+            trayIcon.ShowBalloonTip(3500, "红龙G49 PRO鼠标电量助手",
                 "无法更新开机启动设置：" + ex.Message, ToolTipIcon.Warning);
         }
     }
@@ -178,7 +178,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             }
             catch (Exception ex)
             {
-                trayIcon.ShowBalloonTip(3500, "G49 鼠标电量",
+                trayIcon.ShowBalloonTip(3500, "红龙G49 PRO鼠标电量助手",
                     "无法保存桌面标签设置：" + ex.Message, ToolTipIcon.Warning);
             }
         }
@@ -362,7 +362,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             MessageBox.Show(
                 string.Format("电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n\r\n低于 15% 且未充电时会提醒。",
                     lastReading.Percent, charging, lastReading.Millivolts),
-                "G49 鼠标电量",
+                "红龙G49 PRO鼠标电量助手",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
@@ -374,7 +374,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             MessageBox.Show(
                 "暂时无法读取鼠标电量。\r\n\r\n" + wakeHint + "；程序将在" + DescribeNextPoll() +
                 "自动重试；也可以右键托盘图标选择“立即刷新”。\r\n\r\n原因：" + lastError,
-                "G49 鼠标电量",
+                "红龙G49 PRO鼠标电量助手",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
         }
@@ -404,11 +404,11 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         try
         {
             Clipboard.SetText(text);
-            trayIcon.ShowBalloonTip(2500, "G49 鼠标电量", "诊断信息已复制到剪贴板。", ToolTipIcon.Info);
+            trayIcon.ShowBalloonTip(2500, "红龙G49 PRO鼠标电量助手", "诊断信息已复制到剪贴板。", ToolTipIcon.Info);
         }
         catch (ExternalException)
         {
-            trayIcon.ShowBalloonTip(2500, "G49 鼠标电量", "剪贴板当前被其他程序占用。", ToolTipIcon.Warning);
+            trayIcon.ShowBalloonTip(2500, "红龙G49 PRO鼠标电量助手", "剪贴板当前被其他程序占用。", ToolTipIcon.Warning);
         }
     }
 
