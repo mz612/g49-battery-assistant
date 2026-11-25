@@ -457,9 +457,21 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         lastReading = reading;
         lastError = "";
 
-        string charging = reading.IsCharging ? "充电中" : "未充电";
-        string tooltip = string.Format("G49 鼠标：{0}% | {1} | {2} mV", reading.Percent, charging, reading.Millivolts);
-        statusItem.Text = string.Format("G49：{0}%（{1}，{2} mV）", reading.Percent, charging, reading.Millivolts);
+        string modeName = reading.Mode == BatteryConnectionMode.Bluetooth ? "蓝牙" : "2.4G";
+        string tooltip;
+        if (reading.Mode == BatteryConnectionMode.Bluetooth)
+        {
+            statusItem.Text = string.Format("G49：{0}%（蓝牙模式）", reading.Percent);
+            tooltip = string.Format("G49 鼠标：{0}% | 蓝牙模式", reading.Percent);
+        }
+        else
+        {
+            string charging = reading.IsCharging ? "充电中" : "未充电";
+            statusItem.Text = string.Format("G49：{0}%（{1}，{2}，{3} mV）",
+                reading.Percent, modeName, charging, reading.Millivolts);
+            tooltip = string.Format("G49 鼠标：{0}% | {1} | {2} mV",
+                reading.Percent, charging, reading.Millivolts);
+        }
         trayIcon.Text = LimitTooltip(tooltip);
         SetTrayIcon(TrayIconFactory.CreateBatteryIcon(reading.Percent, reading.IsCharging, lowBatteryThresholdPercent));
         taskbarWidget.SetReading(reading.Percent, reading.IsCharging, tooltip);
@@ -536,10 +548,22 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             : "当前已关闭低电量提醒（可右键重新开启）。";
         if (hasReading)
         {
-            string charging = lastReading.IsCharging ? "是" : "否";
+            string body;
+            if (lastReading.Mode == BatteryConnectionMode.Bluetooth)
+            {
+                body = string.Format(
+                    "连接方式：蓝牙模式\r\n电量：{0}%\r\n（蓝牙模式使用系统 BLE 电池服务，不含充电状态与电压）\r\n\r\n{1}",
+                    lastReading.Percent, thresholdHint);
+            }
+            else
+            {
+                string charging = lastReading.IsCharging ? "是" : "否";
+                body = string.Format(
+                    "连接方式：2.4G 接收器\r\n电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n\r\n{3}",
+                    lastReading.Percent, charging, lastReading.Millivolts, thresholdHint);
+            }
             MessageBox.Show(
-                string.Format("电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n\r\n{3}",
-                    lastReading.Percent, charging, lastReading.Millivolts, thresholdHint),
+                body,
                 "红龙G49 PRO鼠标电量助手",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -548,7 +572,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         {
             string wakeHint = IsLikelySleepingFailure(lastError)
                 ? "鼠标可能处于休眠状态，请移动一下鼠标唤醒它"
-                : "请确认接收器已连接";
+                : "请确认 2.4G 接收器已插入，或鼠标已通过蓝牙连接";
             MessageBox.Show(
                 "暂时无法读取鼠标电量。\r\n\r\n" + wakeHint + "；程序将在" + DescribeNextPoll() +
                 "自动重试；也可以右键图标选择“立即刷新”。\r\n\r\n原因：" + lastError,
@@ -574,12 +598,22 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             nextPollText);
         if (hasReading)
         {
-            text = string.Format(
-                "G49 Battery Tray\r\n状态：可读取\r\n电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n协议：HID report 08 04（只读 BatteryLevel 请求）{3}",
-                lastReading.Percent,
-                lastReading.IsCharging ? "是" : "否",
-                lastReading.Millivolts,
-                schedule);
+            if (lastReading.Mode == BatteryConnectionMode.Bluetooth)
+            {
+                text = string.Format(
+                    "G49 Battery Tray\r\n状态：可读取\r\n连接方式：蓝牙模式\r\n电量：{0}%\r\n协议：BLE GATT Battery Service (0x180F / 0x2A19){1}",
+                    lastReading.Percent,
+                    schedule);
+            }
+            else
+            {
+                text = string.Format(
+                    "G49 Battery Tray\r\n状态：可读取\r\n连接方式：2.4G 接收器\r\n电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n协议：HID report 08 04（只读 BatteryLevel 请求）{3}",
+                    lastReading.Percent,
+                    lastReading.IsCharging ? "是" : "否",
+                    lastReading.Millivolts,
+                    schedule);
+            }
         }
         else
         {
@@ -654,11 +688,18 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
     }
 }
 
+internal enum BatteryConnectionMode
+{
+    Receiver24G = 0,
+    Bluetooth = 1
+}
+
 internal struct BatteryReading
 {
     public byte Percent;
     public bool IsCharging;
     public ushort Millivolts;
+    public BatteryConnectionMode Mode;
 }
 
 internal static class G49BatteryReader
@@ -723,6 +764,40 @@ internal static class G49BatteryReader
     {
         reading = new BatteryReading();
         error = "";
+
+        // 1. Fast check (~2ms when disconnected): if G49 is currently connected via Bluetooth,
+        //    read standard BLE GATT Battery Service (0x180F / 0x2A19) directly without waiting
+        //    for an idle 2.4G dongle to time out.
+        bool bleConnected;
+        string bleError;
+        if (G49BluetoothBatteryReader.TryReadConnected(out reading, out bleConnected, out bleError))
+            return true;
+
+        // 2. Otherwise read from the 2.4G USB receiver HID command endpoint.
+        string hidError;
+        if (TryReadFrom24GReceiver(out reading, out hidError))
+            return true;
+
+        if (bleConnected && !string.IsNullOrEmpty(bleError))
+        {
+            error = "蓝牙读取失败：" + bleError;
+            return false;
+        }
+
+        if (hidError == "没有找到 G49 接收器的 HID 命令端点")
+        {
+            error = "未检测到已连接的 G49 蓝牙鼠标，也未找到 2.4G 接收器";
+            return false;
+        }
+
+        error = hidError;
+        return false;
+    }
+
+    private static bool TryReadFrom24GReceiver(out BatteryReading reading, out string error)
+    {
+        reading = new BatteryReading();
+        error = "";
         List<string> paths = FindCommandCollectionPaths();
         if (paths.Count == 0)
         {
@@ -735,7 +810,10 @@ internal static class G49BatteryReader
         {
             string failure;
             if (TryReadFromPath(path, out reading, out failure))
+            {
+                reading.Mode = BatteryConnectionMode.Receiver24G;
                 return true;
+            }
             reasons.Add(failure);
         }
 
@@ -1003,6 +1081,7 @@ internal static class G49BatteryReader
         reading.Percent = percent;
         reading.IsCharging = frame[7] != 0;
         reading.Millivolts = millivolts;
+        reading.Mode = BatteryConnectionMode.Receiver24G;
         return true;
     }
 
@@ -1012,6 +1091,458 @@ internal static class G49BatteryReader
         byte[] result = new byte[length];
         Array.Copy(input, result, length);
         return result;
+    }
+}
+
+internal static class G49BluetoothBatteryReader
+{
+    private static readonly Guid GuidBatteryService = new Guid("0000180f-0000-1000-8000-00805f9b34fb");
+    private static readonly DEVPROPKEY DevpkeyIsConnected = new DEVPROPKEY
+    {
+        fmtid = new Guid("83da6326-97a6-4088-9453-a1923f573b29"),
+        pid = 15
+    };
+    private static readonly DEVPROPKEY DevpkeyBluetoothBattery = new DEVPROPKEY
+    {
+        fmtid = new Guid("104ea319-6ee2-4701-bd47-8ddbf425bbe5"),
+        pid = 2
+    };
+    private static readonly DEVPROPKEY DevpkeyFriendlyName = new DEVPROPKEY
+    {
+        fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"),
+        pid = 14
+    };
+
+    private const uint DigcfPresent = 0x00000002;
+    private const uint DigcfDeviceInterface = 0x00000010;
+    private const uint GenericRead = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint OpenExisting = 3;
+    private const uint BluetoothGattFlagNone = 0x00000000;
+    private const uint BluetoothGattFlagForceRead = 0x00000004;
+    private const ushort BatteryLevelCharacteristicUuid = 0x2A19;
+    private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DEVPROPKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVINFO_DATA
+    {
+        public uint cbSize;
+        public Guid ClassGuid;
+        public uint DevInst;
+        public IntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVICE_INTERFACE_DATA
+    {
+        public uint cbSize;
+        public Guid InterfaceClassGuid;
+        public uint Flags;
+        public IntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 20)]
+    private struct BTH_LE_UUID
+    {
+        [FieldOffset(0)] public byte IsShortUuid;
+        [FieldOffset(4)] public ushort ShortUuid;
+        [FieldOffset(4)] public Guid LongUuid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BTH_LE_GATT_CHARACTERISTIC
+    {
+        public ushort ServiceHandle;
+        public BTH_LE_UUID CharacteristicUuid;
+        public ushort AttributeHandle;
+        public ushort CharacteristicValueHandle;
+        public byte IsBroadcastable;
+        public byte IsReadable;
+        public byte IsWritable;
+        public byte IsWritableWithoutResponse;
+        public byte IsSignedWritable;
+        public byte IsNotifiable;
+        public byte IsIndicatable;
+        public byte HasExtendedProperties;
+    }
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, string enumerator, IntPtr hwndParent, uint flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiEnumDeviceInterfaces(IntPtr deviceInfoSet, IntPtr deviceInfoData,
+        ref Guid interfaceClassGuid, uint memberIndex, ref SP_DEVICE_INTERFACE_DATA deviceInterfaceData);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr deviceInfoSet,
+        ref SP_DEVICE_INTERFACE_DATA deviceInterfaceData, IntPtr detailData, uint detailDataSize,
+        out uint requiredSize, ref SP_DEVINFO_DATA deviceInfoData);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetupDiGetDeviceProperty(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData,
+        ref DEVPROPKEY propertyKey, out uint propertyType, byte[] propertyBuffer, uint propertyBufferSize,
+        out uint requiredSize, uint flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Get_DevNode_PropertyW(uint dnDevInst, ref DEVPROPKEY propertyKey,
+        out uint propertyType, byte[] propertyBuffer, ref uint propertyBufferSize, uint ulFlags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(string fileName, uint desiredAccess, uint shareMode,
+        IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("BluetoothAPIs.dll", SetLastError = true)]
+    private static extern int BluetoothGATTGetCharacteristics(IntPtr hDevice, IntPtr service,
+        ushort characteristicsBufferCount, [Out] BTH_LE_GATT_CHARACTERISTIC[] characteristicsBuffer,
+        out ushort characteristicsBufferActual, uint flags);
+
+    [DllImport("BluetoothAPIs.dll", SetLastError = true)]
+    private static extern int BluetoothGATTGetCharacteristicValue(IntPtr hDevice,
+        ref BTH_LE_GATT_CHARACTERISTIC characteristic, uint valueBufferSize, IntPtr valueBuffer,
+        out ushort valueBufferSizeRequired, uint flags);
+
+    private sealed class BleCandidate
+    {
+        public readonly string Path;
+        public readonly uint ParentDevInst;
+        public readonly int Priority;
+
+        public BleCandidate(string path, uint parentDevInst, int priority)
+        {
+            Path = path;
+            ParentDevInst = parentDevInst;
+            Priority = priority;
+        }
+    }
+
+    public static bool TryReadConnected(out BatteryReading reading, out bool foundConnected, out string error)
+    {
+        reading = new BatteryReading();
+        foundConnected = false;
+        error = "";
+
+        List<BleCandidate> candidates;
+        try
+        {
+            candidates = FindConnectedG49Candidates();
+        }
+        catch (Exception ex)
+        {
+            error = "枚举蓝牙电池服务失败(" + ex.Message + ")";
+            return false;
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        foundConnected = true;
+        List<string> reasons = new List<string>();
+        foreach (BleCandidate candidate in candidates)
+        {
+            byte percent;
+            string reason;
+            if (TryReadGattBattery(candidate.Path, out percent, out reason) ||
+                TryReadParentPnPBattery(candidate.ParentDevInst, out percent))
+            {
+                reading.Percent = percent;
+                reading.IsCharging = false;
+                reading.Millivolts = 0;
+                reading.Mode = BatteryConnectionMode.Bluetooth;
+                return true;
+            }
+            if (!string.IsNullOrEmpty(reason))
+                reasons.Add(reason);
+        }
+
+        error = reasons.Count == 0 ? "读取蓝牙电量失败" : string.Join("；", reasons.ToArray());
+        return false;
+    }
+
+    private static List<BleCandidate> FindConnectedG49Candidates()
+    {
+        List<BleCandidate> result = new List<BleCandidate>();
+        Guid serviceGuid = GuidBatteryService;
+        IntPtr deviceInfoSet = SetupDiGetClassDevs(ref serviceGuid, null, IntPtr.Zero,
+            DigcfPresent | DigcfDeviceInterface);
+        if (deviceInfoSet == InvalidHandle || deviceInfoSet == IntPtr.Zero)
+            return result;
+
+        try
+        {
+            uint index = 0;
+            while (true)
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = (uint)Marshal.SizeOf(typeof(SP_DEVICE_INTERFACE_DATA));
+                if (!SetupDiEnumDeviceInterfaces(deviceInfoSet, IntPtr.Zero, ref serviceGuid, index, ref ifData))
+                    break;
+                index++;
+
+                SP_DEVINFO_DATA devInfo = new SP_DEVINFO_DATA();
+                devInfo.cbSize = (uint)Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+                uint requiredSize;
+                SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref ifData, IntPtr.Zero, 0,
+                    out requiredSize, ref devInfo);
+                if (requiredSize <= 4)
+                    continue;
+
+                IntPtr detailBuffer = Marshal.AllocHGlobal((int)requiredSize);
+                try
+                {
+                    Marshal.WriteInt32(detailBuffer, IntPtr.Size == 8 ? 8 : 6);
+                    if (!SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref ifData, detailBuffer, requiredSize,
+                        out requiredSize, ref devInfo))
+                    {
+                        continue;
+                    }
+
+                    string path = Marshal.PtrToStringUni(new IntPtr(detailBuffer.ToInt64() + 4));
+                    if (string.IsNullOrEmpty(path))
+                        continue;
+
+                    uint parentDevInst = 0;
+                    CM_Get_Parent(out parentDevInst, devInfo.DevInst, 0);
+
+                    int priority = MatchG49CandidatePriority(path, parentDevInst);
+                    if (priority <= 0)
+                        continue;
+
+                    bool serviceConnected = GetDevInfoBoolProperty(deviceInfoSet, ref devInfo, DevpkeyIsConnected);
+                    bool parentConnected = parentDevInst != 0 && GetDevNodeBoolProperty(parentDevInst, DevpkeyIsConnected);
+                    if (!serviceConnected && !parentConnected)
+                        continue;
+
+                    result.Add(new BleCandidate(path, parentDevInst, priority));
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(detailBuffer);
+                }
+            }
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        }
+
+        result.Sort(delegate(BleCandidate a, BleCandidate b) { return b.Priority.CompareTo(a.Priority); });
+        return result;
+    }
+
+    private static int MatchG49CandidatePriority(string interfacePath, uint parentDevInst)
+    {
+        string lower = interfacePath.ToLowerInvariant();
+        bool matchesVendor = lower.Contains("vid&023554") ||
+                             lower.Contains("vid&013554") ||
+                             lower.Contains("vid_3554");
+        if (matchesVendor)
+            return lower.Contains("pid&f533") ? 100 : 80;
+
+        if (parentDevInst != 0)
+        {
+            string friendlyName = GetDevNodeStringProperty(parentDevInst, DevpkeyFriendlyName);
+            if (!string.IsNullOrEmpty(friendlyName) &&
+                friendlyName.IndexOf("g49", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 60;
+            }
+        }
+
+        return 0;
+    }
+
+    private static bool GetDevInfoBoolProperty(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA devInfo, DEVPROPKEY key)
+    {
+        byte[] buffer = new byte[4];
+        uint propType;
+        uint requiredSize;
+        if (SetupDiGetDeviceProperty(deviceInfoSet, ref devInfo, ref key, out propType,
+            buffer, (uint)buffer.Length, out requiredSize, 0))
+        {
+            return buffer[0] != 0;
+        }
+        return false;
+    }
+
+    private static bool GetDevNodeBoolProperty(uint devInst, DEVPROPKEY key)
+    {
+        byte[] buffer = new byte[4];
+        uint propType;
+        uint size = (uint)buffer.Length;
+        if (CM_Get_DevNode_PropertyW(devInst, ref key, out propType, buffer, ref size, 0) == 0 && size >= 1)
+            return buffer[0] != 0;
+        return false;
+    }
+
+    private static string GetDevNodeStringProperty(uint devInst, DEVPROPKEY key)
+    {
+        uint propType;
+        uint size = 0;
+        CM_Get_DevNode_PropertyW(devInst, ref key, out propType, null, ref size, 0);
+        if (size < 2 || size > 1024)
+            return "";
+
+        byte[] buffer = new byte[size];
+        if (CM_Get_DevNode_PropertyW(devInst, ref key, out propType, buffer, ref size, 0) != 0)
+            return "";
+
+        return Encoding.Unicode.GetString(buffer, 0, (int)size).TrimEnd('\0');
+    }
+
+    private static bool TryReadParentPnPBattery(uint parentDevInst, out byte percent)
+    {
+        percent = 0;
+        if (parentDevInst == 0)
+            return false;
+
+        byte[] buffer = new byte[4];
+        uint propType;
+        uint size = (uint)buffer.Length;
+        DEVPROPKEY key = DevpkeyBluetoothBattery;
+        if (CM_Get_DevNode_PropertyW(parentDevInst, ref key, out propType, buffer, ref size, 0) == 0 && size >= 1)
+        {
+            byte value = buffer[0];
+            if (value <= 100)
+            {
+                percent = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool TryReadGattBattery(string path, out byte percent, out string error)
+    {
+        percent = 0;
+        error = "";
+        IntPtr handle = CreateFile(path, GenericRead, FileShareRead | FileShareWrite,
+            IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+        if (handle == InvalidHandle)
+        {
+            error = "打开 BLE 电池服务失败(" + Marshal.GetLastWin32Error() + ")";
+            return false;
+        }
+
+        try
+        {
+            ushort count = 0;
+            int hr = BluetoothGATTGetCharacteristics(handle, IntPtr.Zero, 0, null, out count, BluetoothGattFlagNone);
+            if (count == 0)
+            {
+                error = "未发现 BLE 电池特征(0x" + hr.ToString("X8") + ")";
+                return false;
+            }
+
+            BTH_LE_GATT_CHARACTERISTIC[] chars = new BTH_LE_GATT_CHARACTERISTIC[count];
+            hr = BluetoothGATTGetCharacteristics(handle, IntPtr.Zero, count, chars, out count, BluetoothGattFlagNone);
+            if (hr != 0)
+            {
+                error = "获取 BLE 电池特征失败(0x" + hr.ToString("X8") + ")";
+                return false;
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                BTH_LE_GATT_CHARACTERISTIC ch = chars[i];
+                if (ch.CharacteristicUuid.IsShortUuid == 0 ||
+                    ch.CharacteristicUuid.ShortUuid != BatteryLevelCharacteristicUuid)
+                {
+                    continue;
+                }
+
+                // First request a fresh value from the connected mouse; fall back to the
+                // Windows GATT cache if a transient link hiccup occurs.
+                if (TryReadCharacteristicValue(handle, ref ch, BluetoothGattFlagForceRead, out percent, out error))
+                    return true;
+                if (TryReadCharacteristicValue(handle, ref ch, BluetoothGattFlagNone, out percent, out error))
+                    return true;
+                return false;
+            }
+
+            error = "BLE 电池服务缺少 0x2A19 电量特征";
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            error = "当前系统不支持 BluetoothAPIs BLE GATT 接口";
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            error = "缺少 BluetoothAPIs.dll";
+            return false;
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    private static bool TryReadCharacteristicValue(
+        IntPtr handle, ref BTH_LE_GATT_CHARACTERISTIC characteristic, uint flags,
+        out byte percent, out string error)
+    {
+        percent = 0;
+        error = "";
+        ushort requiredSize = 0;
+        int hr = BluetoothGATTGetCharacteristicValue(handle, ref characteristic, 0, IntPtr.Zero,
+            out requiredSize, flags);
+        if (requiredSize < 5)
+        {
+            error = "读取 BLE 电量长度失败(0x" + hr.ToString("X8") + ")";
+            return false;
+        }
+
+        IntPtr buffer = Marshal.AllocHGlobal(requiredSize);
+        try
+        {
+            ushort actualSize = 0;
+            hr = BluetoothGATTGetCharacteristicValue(handle, ref characteristic, requiredSize, buffer,
+                out actualSize, flags);
+            if (hr != 0)
+            {
+                error = "读取 BLE 电量值失败(0x" + hr.ToString("X8") + ")";
+                return false;
+            }
+
+            int dataSize = Marshal.ReadInt32(buffer);
+            if (dataSize < 1)
+            {
+                error = "BLE 电量回包为空";
+                return false;
+            }
+
+            byte value = Marshal.ReadByte(buffer, 4);
+            if (value > 100)
+            {
+                error = "BLE 电量值异常(" + value + ")";
+                return false;
+            }
+
+            percent = value;
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 }
 
