@@ -5,16 +5,29 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.Media;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
 internal static class Program
 {
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDPIAware();
+
+    private static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new IntPtr(-4);
+
     [STAThread]
     private static void Main()
     {
+        EnableDpiAwareness();
+
         bool firstInstance;
         using (System.Threading.Mutex instanceMutex = new System.Threading.Mutex(
             true, @"Local\G49ProBatteryTray", out firstInstance))
@@ -31,67 +44,117 @@ internal static class Program
             Application.Run(new G49BatteryTrayContext());
         }
     }
+
+    private static void EnableDpiAwareness()
+    {
+        try
+        {
+            if (SetProcessDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2))
+                return;
+        }
+        catch (EntryPointNotFoundException)
+        {
+        }
+        catch (DllNotFoundException)
+        {
+        }
+
+        try
+        {
+            SetProcessDPIAware();
+        }
+        catch (Exception)
+        {
+        }
+    }
 }
 
 internal sealed class G49BatteryTrayContext : ApplicationContext
 {
-    // Normal polling follows the requested ten-minute cadence. Shorter delays
+    // Normal polling follows the requested five-minute cadence. Shorter delays
     // are used only while recovering from an unavailable receiver at logon or
-    // after the mouse has gone to sleep.
-    private const int PollIntervalMilliseconds = 10 * 60 * 1000;
+    // after the mouse has gone to sleep. Automatic polls are skipped while the
+    // user is idle so we never interfere with the mouse's sleep timer.
+    private const int PollIntervalMilliseconds = 5 * 60 * 1000;
+    private const uint IdleSkipThresholdMilliseconds = 60 * 1000;
+    private const int IdleCheckIntervalMilliseconds = 3 * 1000;
+    private const int ResumePollDelayMilliseconds = 1500;
     private static readonly int[] FailedReadRetryIntervalsMilliseconds =
     {
         15 * 1000,
         60 * 1000,
-        5 * 60 * 1000,
-        15 * 60 * 1000
+        5 * 60 * 1000
     };
-    private const int LowBatteryPercent = 15;
+    private const int DefaultLowBatteryPercent = 10;
     private const int LowBatteryReminderMinutes = 30;
+    private static readonly int[] PresetLowBatteryThresholds = { 10, 15, 20, 25, 30, 50 };
 
     private readonly NotifyIcon trayIcon;
     private readonly ContextMenuStrip menu;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem refreshItem;
+    private readonly ToolStripMenuItem lowBatteryMenuItem;
+    private readonly List<ToolStripMenuItem> presetThresholdItems = new List<ToolStripMenuItem>();
+    private readonly ToolStripMenuItem customThresholdItem;
+    private readonly ToolStripMenuItem disableThresholdItem;
     private readonly ToolStripMenuItem startupItem;
-    private readonly ToolStripMenuItem desktopBadgeItem;
     private readonly ToolStripMenuItem diagnosticItem;
+    private readonly TaskbarBatteryWidget taskbarWidget;
     private readonly System.Threading.Timer pollTimer;
+    private readonly Timer idleResumeTimer;
     private readonly BackgroundWorker pollWorker;
-    private readonly BatteryBadgeForm desktopBadge;
     private readonly Control pollInvoker;
     private Icon activeIcon;
     private BatteryReading lastReading;
     private bool hasReading;
+    private int lowBatteryThresholdPercent;
     private string lastError = "正在读取鼠标电量...";
     private DateTime lastLowBatteryAlertUtc = DateTime.MinValue;
     private DateTime lastPollAttemptLocal = DateTime.MinValue;
     private DateTime nextPollLocal = DateTime.MinValue;
+    private bool pollDeferredForIdle;
     private int consecutiveReadFailures;
     private bool disposed;
 
     public G49BatteryTrayContext()
     {
+        lowBatteryThresholdPercent = AlertSettings.GetLowBatteryThreshold(DefaultLowBatteryPercent);
+
         menu = new ContextMenuStrip();
         statusItem = new ToolStripMenuItem("G49：正在读取...");
         statusItem.Enabled = false;
-        refreshItem = new ToolStripMenuItem("立即刷新", null, delegate { StartPoll(); });
+        refreshItem = new ToolStripMenuItem("立即刷新", null, delegate { StartPoll(true); });
+        lowBatteryMenuItem = new ToolStripMenuItem();
+        foreach (int preset in PresetLowBatteryThresholds)
+        {
+            int value = preset;
+            string label = preset == DefaultLowBatteryPercent
+                ? string.Format("{0}%（默认）", preset)
+                : string.Format("{0}%", preset);
+            ToolStripMenuItem item = new ToolStripMenuItem(label, null, delegate { UpdateLowBatteryThreshold(value); });
+            item.Tag = value;
+            presetThresholdItems.Add(item);
+            lowBatteryMenuItem.DropDownItems.Add(item);
+        }
+        lowBatteryMenuItem.DropDownItems.Add(new ToolStripSeparator());
+        customThresholdItem = new ToolStripMenuItem("自定义百分比...", null, delegate { PromptCustomThreshold(); });
+        disableThresholdItem = new ToolStripMenuItem("关闭低电量提醒", null, delegate { UpdateLowBatteryThreshold(0); });
+        lowBatteryMenuItem.DropDownItems.Add(customThresholdItem);
+        lowBatteryMenuItem.DropDownItems.Add(disableThresholdItem);
+        SyncLowBatteryMenuState();
+
         startupItem = new ToolStripMenuItem("开机启动");
         startupItem.CheckOnClick = true;
         startupItem.Checked = StartupSettings.IsEnabled();
         startupItem.CheckedChanged += StartupItem_CheckedChanged;
-        desktopBadgeItem = new ToolStripMenuItem("显示桌面电量标签（推荐）");
-        desktopBadgeItem.CheckOnClick = true;
-        desktopBadgeItem.Checked = DesktopBadgeSettings.IsVisible();
-        desktopBadgeItem.CheckedChanged += DesktopBadgeItem_CheckedChanged;
         diagnosticItem = new ToolStripMenuItem("复制诊断信息", null, delegate { CopyDiagnosticInfo(); });
         ToolStripMenuItem exitItem = new ToolStripMenuItem("退出", null, delegate { ExitThread(); });
 
         menu.Items.Add(statusItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(refreshItem);
+        menu.Items.Add(lowBatteryMenuItem);
         menu.Items.Add(startupItem);
-        menu.Items.Add(desktopBadgeItem);
         menu.Items.Add(diagnosticItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
@@ -103,22 +166,130 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         SetTrayIcon(TrayIconFactory.CreateUnknownIcon());
         trayIcon.Visible = true;
 
-        desktopBadge = new BatteryBadgeForm();
-        desktopBadge.ContextMenuStrip = menu;
-        desktopBadge.DismissRequested += DesktopBadge_DismissRequested;
-        SetDesktopBadgeVisible(desktopBadgeItem.Checked, false);
+        taskbarWidget = new TaskbarBatteryWidget(menu);
+        taskbarWidget.SetLowBatteryThreshold(lowBatteryThresholdPercent);
+        taskbarWidget.StatusRequested += delegate { ShowStatus(); };
+        taskbarWidget.SetUnknown("G49 鼠标：正在读取电量");
+        taskbarWidget.StartDocking();
 
-        // Keep a message-pump target even when the desktop badge is hidden.
+        // Keep a UI-thread message-pump target for timer callbacks.
         pollInvoker = new Control();
         pollInvoker.CreateControl();
+
+        SystemEvents.DisplaySettingsChanged += SystemEvents_DisplaySettingsChanged;
+        SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
 
         pollWorker = new BackgroundWorker();
         pollWorker.DoWork += PollWorker_DoWork;
         pollWorker.RunWorkerCompleted += PollWorker_RunWorkerCompleted;
 
+        idleResumeTimer = new Timer();
+        idleResumeTimer.Interval = IdleCheckIntervalMilliseconds;
+        idleResumeTimer.Tick += IdleResumeTimer_Tick;
+
         pollTimer = new System.Threading.Timer(PollTimerCallback, null,
             System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
-        StartPoll();
+        StartPoll(true);
+    }
+
+    private void SystemEvents_DisplaySettingsChanged(object sender, EventArgs e)
+    {
+        if (disposed || pollInvoker.IsDisposed || !pollInvoker.IsHandleCreated)
+            return;
+
+        try
+        {
+            pollInvoker.BeginInvoke(new MethodInvoker(RefreshIconsForEnvironmentChange));
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        if (disposed || pollInvoker.IsDisposed || !pollInvoker.IsHandleCreated)
+            return;
+
+        try
+        {
+            pollInvoker.BeginInvoke(new MethodInvoker(RefreshIconsForEnvironmentChange));
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private void RefreshIconsForEnvironmentChange()
+    {
+        if (disposed)
+            return;
+
+        if (hasReading)
+            SetTrayIcon(TrayIconFactory.CreateBatteryIcon(lastReading.Percent, lastReading.IsCharging, lowBatteryThresholdPercent));
+        else
+            SetTrayIcon(TrayIconFactory.CreateUnknownIcon());
+
+        taskbarWidget.RefreshAppearance();
+    }
+
+    private void SyncLowBatteryMenuState()
+    {
+        lowBatteryMenuItem.Text = lowBatteryThresholdPercent > 0
+            ? string.Format("低电量提醒（≤ {0}%）", lowBatteryThresholdPercent)
+            : "低电量提醒（已关闭）";
+
+        bool matchedPreset = false;
+        foreach (ToolStripMenuItem item in presetThresholdItems)
+        {
+            int preset = (int)item.Tag;
+            bool isSelected = lowBatteryThresholdPercent == preset;
+            item.Checked = isSelected;
+            if (isSelected)
+                matchedPreset = true;
+        }
+
+        disableThresholdItem.Checked = lowBatteryThresholdPercent <= 0;
+        customThresholdItem.Checked = lowBatteryThresholdPercent > 0 && !matchedPreset;
+        customThresholdItem.Text = customThresholdItem.Checked
+            ? string.Format("自定义百分比（当前 {0}%）...", lowBatteryThresholdPercent)
+            : "自定义百分比...";
+    }
+
+    private void PromptCustomThreshold()
+    {
+        int initialValue = lowBatteryThresholdPercent > 0 ? lowBatteryThresholdPercent : DefaultLowBatteryPercent;
+        using (LowBatteryThresholdDialog dialog = new LowBatteryThresholdDialog(initialValue))
+        {
+            if (dialog.ShowDialog() == DialogResult.OK)
+                UpdateLowBatteryThreshold(dialog.ThresholdPercent);
+        }
+    }
+
+    private void UpdateLowBatteryThreshold(int newThreshold)
+    {
+        int clamped = AlertSettings.ClampThreshold(newThreshold);
+        try
+        {
+            AlertSettings.SetLowBatteryThreshold(clamped);
+        }
+        catch (Exception ex)
+        {
+            trayIcon.ShowBalloonTip(3500, "红龙G49 PRO鼠标电量助手",
+                "无法保存低电量提醒设置：" + ex.Message, ToolTipIcon.Warning);
+            return;
+        }
+
+        lowBatteryThresholdPercent = clamped;
+        lastLowBatteryAlertUtc = DateTime.MinValue;
+        SyncLowBatteryMenuState();
+        taskbarWidget.SetLowBatteryThreshold(lowBatteryThresholdPercent);
+
+        if (hasReading)
+        {
+            SetTrayIcon(TrayIconFactory.CreateBatteryIcon(lastReading.Percent, lastReading.IsCharging, lowBatteryThresholdPercent));
+            CheckLowBatteryAlert(lastReading);
+        }
     }
 
     private void PollTimerCallback(object state)
@@ -128,11 +299,30 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
 
         try
         {
-            pollInvoker.BeginInvoke(new MethodInvoker(StartPoll));
+            pollInvoker.BeginInvoke(new MethodInvoker(delegate { StartPoll(false); }));
         }
         catch (InvalidOperationException)
         {
             // The UI is closing; ExitThreadCore will dispose the timer.
+        }
+    }
+
+    private void IdleResumeTimer_Tick(object sender, EventArgs e)
+    {
+        if (disposed || !pollDeferredForIdle)
+        {
+            idleResumeTimer.Stop();
+            return;
+        }
+
+        uint idleMs;
+        if (UserInputMonitor.TryGetIdleMilliseconds(out idleMs) && idleMs < IdleSkipThresholdMilliseconds)
+        {
+            // User returned and moved the mouse or pressed a key. Give a sleeping mouse a brief
+            // moment (~1.5s) to re-link with the 2.4G receiver before sending the battery query.
+            pollDeferredForIdle = false;
+            idleResumeTimer.Stop();
+            ScheduleNextPoll(ResumePollDelayMilliseconds);
         }
     }
 
@@ -152,53 +342,28 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         }
     }
 
-    private void DesktopBadgeItem_CheckedChanged(object sender, EventArgs e)
-    {
-        SetDesktopBadgeVisible(desktopBadgeItem.Checked, true);
-    }
-
-    private void DesktopBadge_DismissRequested(object sender, EventArgs e)
+    private void StartPoll(bool force)
     {
         if (disposed)
             return;
 
-        desktopBadgeItem.CheckedChanged -= DesktopBadgeItem_CheckedChanged;
-        desktopBadgeItem.Checked = false;
-        desktopBadgeItem.CheckedChanged += DesktopBadgeItem_CheckedChanged;
-        SetDesktopBadgeVisible(false, true);
-    }
-
-    private void SetDesktopBadgeVisible(bool visible, bool persist)
-    {
-        if (persist)
+        if (!force)
         {
-            try
+            uint idleMs;
+            if (UserInputMonitor.TryGetIdleMilliseconds(out idleMs) && idleMs >= IdleSkipThresholdMilliseconds)
             {
-                DesktopBadgeSettings.SetVisible(visible);
-            }
-            catch (Exception ex)
-            {
-                trayIcon.ShowBalloonTip(3500, "红龙G49 PRO鼠标电量助手",
-                    "无法保存桌面标签设置：" + ex.Message, ToolTipIcon.Warning);
+                // Skip automatic HID polling while the PC is idle so the mouse can sleep undisturbed.
+                pollTimer.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+                nextPollLocal = DateTime.MinValue;
+                pollDeferredForIdle = true;
+                if (!idleResumeTimer.Enabled)
+                    idleResumeTimer.Start();
+                return;
             }
         }
 
-        if (visible)
-        {
-            if (!desktopBadge.Visible)
-                desktopBadge.Show();
-            desktopBadge.BringToFront();
-        }
-        else
-        {
-            desktopBadge.Hide();
-        }
-    }
-
-    private void StartPoll()
-    {
-        if (disposed)
-            return;
+        pollDeferredForIdle = false;
+        idleResumeTimer.Stop();
 
         if (pollWorker.IsBusy)
         {
@@ -293,12 +458,20 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         lastError = "";
 
         string charging = reading.IsCharging ? "充电中" : "未充电";
+        string tooltip = string.Format("G49 鼠标：{0}% | {1} | {2} mV", reading.Percent, charging, reading.Millivolts);
         statusItem.Text = string.Format("G49：{0}%（{1}，{2} mV）", reading.Percent, charging, reading.Millivolts);
-        trayIcon.Text = LimitTooltip(string.Format("G49 鼠标：{0}% | {1} | {2} mV", reading.Percent, charging, reading.Millivolts));
-        SetTrayIcon(TrayIconFactory.CreateBatteryIcon(reading.Percent, reading.IsCharging));
-        desktopBadge.SetReading(reading);
+        trayIcon.Text = LimitTooltip(tooltip);
+        SetTrayIcon(TrayIconFactory.CreateBatteryIcon(reading.Percent, reading.IsCharging, lowBatteryThresholdPercent));
+        taskbarWidget.SetReading(reading.Percent, reading.IsCharging, tooltip);
 
-        bool needsCharge = !reading.IsCharging && reading.Percent < LowBatteryPercent;
+        CheckLowBatteryAlert(reading);
+    }
+
+    private void CheckLowBatteryAlert(BatteryReading reading)
+    {
+        bool needsCharge = lowBatteryThresholdPercent > 0 &&
+                           !reading.IsCharging &&
+                           reading.Percent <= lowBatteryThresholdPercent;
         if (!needsCharge)
         {
             lastLowBatteryAlertUtc = DateTime.MinValue;
@@ -314,7 +487,8 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
             trayIcon.ShowBalloonTip(
                 10000,
                 "G49 鼠标电量低",
-                string.Format("当前仅剩 {0}%，请给鼠标充电。", reading.Percent),
+                string.Format("当前电量 {0}%（已降至设定阈值 {1}% 及以下），请给鼠标充电。",
+                    reading.Percent, lowBatteryThresholdPercent),
                 ToolTipIcon.Warning);
         }
     }
@@ -327,21 +501,22 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         if (hasReading)
         {
             // A transient timeout should not erase a previously verified value.
-            string staleStatus = likelySleeping ? "等待鼠标唤醒" : "读取重试中";
             string statusDescription = likelySleeping ? "鼠标可能休眠" : "本次读取失败";
+            string staleTooltip = string.Format("G49 鼠标：{0}% | {1}，{2}自动重试",
+                lastReading.Percent, statusDescription, retryText);
             statusItem.Text = string.Format("G49：{0}%（{1}，{2}自动重试）",
                 lastReading.Percent, statusDescription, retryText);
-            trayIcon.Text = LimitTooltip(string.Format("G49 鼠标：{0}% | {1}，{2}自动重试",
-                lastReading.Percent, statusDescription, retryText));
-            desktopBadge.SetStale(lastReading, staleStatus);
+            trayIcon.Text = LimitTooltip(staleTooltip);
+            taskbarWidget.SetReading(lastReading.Percent, lastReading.IsCharging, staleTooltip);
             return;
         }
 
         string unavailableDescription = likelySleeping ? "鼠标可能休眠，请移动鼠标唤醒" : "暂时无法读取";
+        string failureTooltip = "G49 鼠标：" + unavailableDescription + "，" + retryText + "自动重试";
         statusItem.Text = string.Format("G49：{0}（{1}自动重试）", unavailableDescription, retryText);
-        trayIcon.Text = LimitTooltip("G49 鼠标：" + unavailableDescription + "，" + retryText + "自动重试");
+        trayIcon.Text = LimitTooltip(failureTooltip);
         SetTrayIcon(TrayIconFactory.CreateUnknownIcon());
-        desktopBadge.SetFailure(lastError);
+        taskbarWidget.SetUnknown(failureTooltip);
     }
 
     private static bool IsLikelySleepingFailure(string error)
@@ -356,12 +531,15 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
 
     private void ShowStatus()
     {
+        string thresholdHint = lowBatteryThresholdPercent > 0
+            ? string.Format("电量降至 {0}% 及以下且未充电时会提醒（可右键修改阈值）。", lowBatteryThresholdPercent)
+            : "当前已关闭低电量提醒（可右键重新开启）。";
         if (hasReading)
         {
             string charging = lastReading.IsCharging ? "是" : "否";
             MessageBox.Show(
-                string.Format("电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n\r\n低于 15% 且未充电时会提醒。",
-                    lastReading.Percent, charging, lastReading.Millivolts),
+                string.Format("电量：{0}%\r\n充电中：{1}\r\n电压：{2} mV\r\n\r\n{3}",
+                    lastReading.Percent, charging, lastReading.Millivolts, thresholdHint),
                 "红龙G49 PRO鼠标电量助手",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -373,7 +551,7 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
                 : "请确认接收器已连接";
             MessageBox.Show(
                 "暂时无法读取鼠标电量。\r\n\r\n" + wakeHint + "；程序将在" + DescribeNextPoll() +
-                "自动重试；也可以右键托盘图标选择“立即刷新”。\r\n\r\n原因：" + lastError,
+                "自动重试；也可以右键图标选择“立即刷新”。\r\n\r\n原因：" + lastError,
                 "红龙G49 PRO鼠标电量助手",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -383,10 +561,17 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
     private void CopyDiagnosticInfo()
     {
         string text;
+        string thresholdText = lowBatteryThresholdPercent > 0
+            ? string.Format("{0}%", lowBatteryThresholdPercent)
+            : "已关闭";
+        string nextPollText = pollDeferredForIdle
+            ? "键鼠空闲已暂缓（恢复活动后查询）"
+            : FormatDiagnosticTime(nextPollLocal);
         string schedule = string.Format(
-            "\r\n上次查询：{0}\r\n下次自动查询：{1}",
+            "\r\n低电量提醒阈值：{0}\r\n上次查询：{1}\r\n下次自动查询：{2}",
+            thresholdText,
             FormatDiagnosticTime(lastPollAttemptLocal),
-            FormatDiagnosticTime(nextPollLocal));
+            nextPollText);
         if (hasReading)
         {
             text = string.Format(
@@ -437,12 +622,16 @@ internal sealed class G49BatteryTrayContext : ApplicationContext
         if (!disposed)
         {
             disposed = true;
+            SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
+            SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
             pollTimer.Dispose();
+            idleResumeTimer.Stop();
+            idleResumeTimer.Dispose();
             pollInvoker.Dispose();
+            taskbarWidget.CloseForExit();
+            taskbarWidget.Dispose();
             trayIcon.Visible = false;
             trayIcon.Dispose();
-            desktopBadge.CloseForExit();
-            desktopBadge.Dispose();
             menu.Dispose();
             if (activeIcon != null)
                 activeIcon.Dispose();
@@ -851,225 +1040,171 @@ internal static class StartupSettings
     }
 }
 
-internal static class DesktopBadgeSettings
+internal static class UserInputMonitor
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    public static bool TryGetIdleMilliseconds(out uint idleMilliseconds)
+    {
+        LASTINPUTINFO info = new LASTINPUTINFO();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref info))
+        {
+            idleMilliseconds = 0;
+            return false;
+        }
+
+        uint now = unchecked((uint)Environment.TickCount);
+        idleMilliseconds = unchecked(now - info.dwTime);
+        return true;
+    }
+}
+
+internal static class AlertSettings
 {
     private const string SettingsKey = @"Software\G49ProBatteryTray";
-    private const string ValueName = "ShowDesktopBadge";
+    private const string ValueName = "LowBatteryThresholdPercent";
+    public const int MinCustomThreshold = 1;
+    public const int MaxCustomThreshold = 95;
 
-    public static bool IsVisible()
+    public static int ClampThreshold(int value)
     {
-        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(SettingsKey, false))
+        if (value <= 0)
+            return 0;
+        if (value < MinCustomThreshold)
+            return MinCustomThreshold;
+        if (value > MaxCustomThreshold)
+            return MaxCustomThreshold;
+        return value;
+    }
+
+    public static int GetLowBatteryThreshold(int defaultValue)
+    {
+        try
         {
-            if (key == null)
-                return true;
-
-            object value = key.GetValue(ValueName);
-            if (value == null)
-                return true;
-
-            try
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(SettingsKey, false))
             {
-                return Convert.ToInt32(value) != 0;
+                if (key == null)
+                    return ClampThreshold(defaultValue);
+
+                object value = key.GetValue(ValueName);
+                if (value == null)
+                    return ClampThreshold(defaultValue);
+
+                return ClampThreshold(Convert.ToInt32(value));
             }
-            catch (Exception)
-            {
-                return true;
-            }
+        }
+        catch (Exception)
+        {
+            return ClampThreshold(defaultValue);
         }
     }
 
-    public static void SetVisible(bool visible)
+    public static void SetLowBatteryThreshold(int percent)
     {
+        int clamped = ClampThreshold(percent);
         using (RegistryKey key = Registry.CurrentUser.CreateSubKey(SettingsKey))
         {
             if (key == null)
-                throw new InvalidOperationException("无法打开桌面标签设置");
-            key.SetValue(ValueName, visible ? 1 : 0, RegistryValueKind.DWord);
+                throw new InvalidOperationException("无法打开当前用户的提醒阈值设置");
+            key.SetValue(ValueName, clamped, RegistryValueKind.DWord);
         }
     }
 }
 
-internal sealed class BatteryBadgeForm : Form
+internal sealed class LowBatteryThresholdDialog : Form
 {
-    private int percent = -1;
-    private bool charging;
-    private string detail = "正在读取";
-    private bool dragging;
-    private Point dragOrigin;
-    private Point windowOrigin;
-    private bool closingForExit;
+    private readonly NumericUpDown thresholdInput;
 
-    public event EventHandler DismissRequested;
-
-    public BatteryBadgeForm()
+    public int ThresholdPercent
     {
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(122, 52);
-        FormBorderStyle = FormBorderStyle.None;
+        get { return (int)thresholdInput.Value; }
+    }
+
+    public LowBatteryThresholdDialog(int currentThreshold)
+    {
+        Text = "自定义低电量提醒阈值";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
         ShowInTaskbar = false;
-        StartPosition = FormStartPosition.Manual;
+        StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
-        DoubleBuffered = true;
-        BackColor = Color.FromArgb(31, 38, 48);
-        Location = DefaultLocation();
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                 ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
-    }
+        AutoScaleMode = AutoScaleMode.Dpi;
+        Font = SystemFonts.MessageBoxFont;
+        ClientSize = new Size(340, 148);
 
-    protected override bool ShowWithoutActivation
-    {
-        get { return true; }
-    }
-
-    protected override CreateParams CreateParams
-    {
-        get
+        try
         {
-            CreateParams parameters = base.CreateParams;
-            parameters.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
-            return parameters;
+            Icon appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            if (appIcon != null)
+                Icon = appIcon;
         }
-    }
-
-    public void SetReading(BatteryReading reading)
-    {
-        percent = reading.Percent;
-        charging = reading.IsCharging;
-        detail = charging ? "充电中" : "G49 鼠标";
-        Invalidate();
-    }
-
-    public void SetFailure(string failure)
-    {
-        percent = -1;
-        charging = false;
-        detail = "暂时无法读取";
-        Invalidate();
-    }
-
-    public void SetStale(BatteryReading reading, string status)
-    {
-        percent = reading.Percent;
-        charging = reading.IsCharging;
-        detail = status;
-        Invalidate();
-    }
-
-    public void CloseForExit()
-    {
-        closingForExit = true;
-        Close();
-    }
-
-    protected override void OnFormClosing(FormClosingEventArgs e)
-    {
-        if (!closingForExit && e.CloseReason == CloseReason.UserClosing)
+        catch (Exception)
         {
-            e.Cancel = true;
-            Hide();
-            EventHandler handler = DismissRequested;
-            if (handler != null)
-                handler(this, EventArgs.Empty);
         }
-        base.OnFormClosing(e);
+
+        Label promptLabel = new Label();
+        promptLabel.AutoSize = true;
+        promptLabel.Text = "当鼠标电量降至以下数值及以下且未充电时提醒：";
+        promptLabel.Location = new Point(18, 18);
+
+        Label valueLabel = new Label();
+        valueLabel.AutoSize = true;
+        valueLabel.Text = "提醒阈值：";
+        valueLabel.Location = new Point(18, 56);
+
+        thresholdInput = new NumericUpDown();
+        thresholdInput.Minimum = AlertSettings.MinCustomThreshold;
+        thresholdInput.Maximum = AlertSettings.MaxCustomThreshold;
+        thresholdInput.Value = Math.Max(AlertSettings.MinCustomThreshold,
+            Math.Min(AlertSettings.MaxCustomThreshold, currentThreshold));
+        thresholdInput.Location = new Point(92, 52);
+        thresholdInput.Width = 84;
+        thresholdInput.TextAlign = HorizontalAlignment.Right;
+
+        Label percentLabel = new Label();
+        percentLabel.AutoSize = true;
+        percentLabel.Text = "%（可填 1 - 95）";
+        percentLabel.Location = new Point(182, 56);
+
+        Button okButton = new Button();
+        okButton.Text = "确定";
+        okButton.DialogResult = DialogResult.OK;
+        okButton.Size = new Size(80, 30);
+        okButton.Location = new Point(156, 102);
+
+        Button cancelButton = new Button();
+        cancelButton.Text = "取消";
+        cancelButton.DialogResult = DialogResult.Cancel;
+        cancelButton.Size = new Size(80, 30);
+        cancelButton.Location = new Point(244, 102);
+
+        Controls.Add(promptLabel);
+        Controls.Add(valueLabel);
+        Controls.Add(thresholdInput);
+        Controls.Add(percentLabel);
+        Controls.Add(okButton);
+        Controls.Add(cancelButton);
+
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    protected override void OnShown(EventArgs e)
     {
-        base.OnPaint(e);
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        Rectangle bounds = new Rectangle(0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
-        Color accent = AccentColor(percent, charging);
-
-        using (GraphicsPath outline = RoundedRectangle(bounds, 11))
-        using (Brush background = new SolidBrush(Color.FromArgb(31, 38, 48)))
-        using (Pen border = new Pen(Color.FromArgb(185, 206, 218, 232), 1.1f))
-        using (Brush accentBrush = new SolidBrush(accent))
-        using (Font percentFont = new Font("Segoe UI", 19f, FontStyle.Bold, GraphicsUnit.Pixel))
-        using (Font detailFont = new Font("Segoe UI", 10f, FontStyle.Regular, GraphicsUnit.Pixel))
-        {
-            e.Graphics.FillPath(background, outline);
-            e.Graphics.DrawPath(border, outline);
-            e.Graphics.FillEllipse(accentBrush, 8, 9, 34, 34);
-
-            string symbol = percent < 0 ? "?" : (charging ? "⚡" : "%");
-            using (Font symbolFont = new Font("Segoe UI Symbol", charging ? 18f : 15f,
-                       FontStyle.Bold, GraphicsUnit.Pixel))
-            {
-                TextRenderer.DrawText(e.Graphics, symbol, symbolFont, new Rectangle(8, 8, 34, 35),
-                    Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.NoPadding);
-            }
-
-            string value = percent < 0 ? "--" : percent.ToString() + "%";
-            TextRenderer.DrawText(e.Graphics, value, percentFont, new Rectangle(47, 5, 70, 25), Color.White,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-            TextRenderer.DrawText(e.Graphics, detail, detailFont, new Rectangle(48, 29, 68, 16),
-                Color.FromArgb(207, 221, 233),
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding |
-                TextFormatFlags.EndEllipsis);
-        }
-    }
-
-    protected override void OnMouseDown(MouseEventArgs e)
-    {
-        base.OnMouseDown(e);
-        if (e.Button == MouseButtons.Left)
-        {
-            dragging = true;
-            dragOrigin = Cursor.Position;
-            windowOrigin = Location;
-        }
-    }
-
-    protected override void OnMouseMove(MouseEventArgs e)
-    {
-        base.OnMouseMove(e);
-        if (dragging)
-        {
-            Point point = Cursor.Position;
-            Location = new Point(windowOrigin.X + point.X - dragOrigin.X,
-                windowOrigin.Y + point.Y - dragOrigin.Y);
-        }
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        dragging = false;
-        base.OnMouseUp(e);
-    }
-
-    private static Point DefaultLocation()
-    {
-        Rectangle workingArea = Screen.PrimaryScreen.WorkingArea;
-        return new Point(workingArea.Right - 142, workingArea.Bottom - 88);
-    }
-
-    private static Color AccentColor(int value, bool isCharging)
-    {
-        if (value < 0)
-            return Color.FromArgb(105, 112, 122);
-        if (isCharging)
-            return Color.FromArgb(42, 145, 214);
-        if (value < 10)
-            return Color.FromArgb(215, 61, 55);
-        if (value < 30)
-            return Color.FromArgb(223, 172, 0);
-        if (value < 50)
-            return Color.FromArgb(239, 137, 0);
-        return Color.FromArgb(24, 166, 88);
-    }
-
-    private static GraphicsPath RoundedRectangle(Rectangle bounds, int radius)
-    {
-        GraphicsPath path = new GraphicsPath();
-        int diameter = radius * 2;
-        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
+        base.OnShown(e);
+        Activate();
+        thresholdInput.Focus();
+        thresholdInput.Select(0, thresholdInput.Text.Length);
     }
 }
 
@@ -1080,30 +1215,41 @@ internal static class TrayIconFactory
 
     public static Icon CreateUnknownIcon()
     {
-        return CreateIcon(-1, false);
+        return CreateIcon(-1, false, 10);
     }
 
-    public static Icon CreateBatteryIcon(int percent, bool charging)
+    public static Icon CreateBatteryIcon(int percent, bool charging, int lowBatteryThreshold)
     {
-        return CreateIcon(Math.Max(0, Math.Min(100, percent)), charging);
+        return CreateIcon(Math.Max(0, Math.Min(100, percent)), charging, lowBatteryThreshold);
     }
 
-    private static Icon CreateIcon(int percent, bool charging)
+    private static int GetTrayIconSize()
     {
-        using (Bitmap bitmap = new Bitmap(32, 32))
+        int width = SystemInformation.SmallIconSize.Width;
+        if (width < 16)
+            return 16;
+        if (width > 64)
+            return 64;
+        return width;
+    }
+
+    private static Icon CreateIcon(int percent, bool charging, int lowBatteryThreshold)
+    {
+        int size = GetTrayIconSize();
+        bool light = IsSystemLightTaskbar();
+        using (Bitmap bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb))
         using (Graphics graphics = Graphics.FromImage(bitmap))
         {
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             graphics.Clear(Color.Transparent);
 
-            if (percent < 0)
-            {
-                DrawUnknown(graphics);
-            }
-            else
-            {
-                DrawBattery(graphics, percent, charging);
-            }
+            float mh = size * 0.84f;
+            float mw = mh * 0.66f;
+            float mx = (size - mw) / 2f;
+            float my = (size - mh) / 2f;
+            DrawLiquidMouse(graphics, mx, my, mw, mh, percent, charging, light, lowBatteryThreshold);
 
             IntPtr handle = bitmap.GetHicon();
             try
@@ -1118,74 +1264,819 @@ internal static class TrayIconFactory
         }
     }
 
-    private static void DrawUnknown(Graphics graphics)
+    public static bool IsCriticalLevel(int percent, bool charging, int lowBatteryThreshold)
     {
-        using (Brush fill = new SolidBrush(Color.FromArgb(105, 112, 122)))
-        using (Pen border = new Pen(Color.White, 2f))
-        using (Font font = new Font("Segoe UI", 17f, FontStyle.Bold, GraphicsUnit.Pixel))
-        {
-            graphics.FillEllipse(fill, 3, 3, 26, 26);
-            graphics.DrawEllipse(border, 3, 3, 26, 26);
-            TextRenderer.DrawText(graphics, "?", font, new Rectangle(4, 3, 24, 26), Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        }
+        if (percent < 0 || charging)
+            return false;
+        int criticalThreshold = lowBatteryThreshold > 0 ? lowBatteryThreshold : 10;
+        return percent <= criticalThreshold;
     }
 
-    private static void DrawBattery(Graphics graphics, int percent, bool charging)
+    public static void DrawLiquidMouse(Graphics graphics, float x, float y, float w, float h,
+        int percent, bool charging, bool lightTaskbar, int lowBatteryThreshold)
     {
-        Color fillColor;
-        if (charging)
-            fillColor = Color.FromArgb(42, 145, 214);
-        else if (percent < 10)
-            fillColor = Color.FromArgb(215, 61, 55);
-        else if (percent < 30)
-            fillColor = Color.FromArgb(223, 172, 0);
-        else if (percent < 50)
-            fillColor = Color.FromArgb(239, 137, 0);
-        else
-            fillColor = Color.FromArgb(24, 166, 88);
+        Color fg = lightTaskbar ? Color.FromArgb(24, 26, 32) : Color.FromArgb(244, 246, 250);
+        Color accent = GetStatusColor(percent, charging, lightTaskbar, lowBatteryThreshold);
+        bool critical = IsCriticalLevel(percent, charging, lowBatteryThreshold);
+        Color strokeColor = critical
+            ? accent
+            : Color.FromArgb(lightTaskbar ? 195 : 220, fg);
 
-        using (Brush fill = new SolidBrush(fillColor))
-        using (Pen outline = new Pen(Color.White, 2f))
-        using (Font font = new Font("Segoe UI", percent >= 100 ? 12f : 16f,
-                   FontStyle.Bold, GraphicsUnit.Pixel))
+        RectangleF body = new RectangleF(x, y, w, h);
+        using (GraphicsPath mousePath = RoundedRectangle(body, w * 0.48f))
         {
-            // At notification-area sizes a classic battery outline is too small to
-            // identify. Use a high-contrast percentage bubble instead.
-            graphics.FillEllipse(fill, 2, 2, 28, 28);
-            graphics.DrawEllipse(outline, 2, 2, 28, 28);
-            string text = percent >= 100 ? "99" : percent.ToString();
-            TextRenderer.DrawText(graphics, text, font, new Rectangle(3, 3, 26, 26), Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        }
+            // Subtle empty-chamber backing so the mouse shape stays crisp on both dark & light taskbars.
+            Color emptyBacking = lightTaskbar
+                ? Color.FromArgb(30, 15, 23, 42)
+                : Color.FromArgb(38, 255, 255, 255);
+            using (Brush backingBrush = new SolidBrush(emptyBacking))
+                graphics.FillPath(backingBrush, mousePath);
 
-        if (charging)
-        {
-            Point[] bolt =
+            // Liquid battery fill rising from bottom to top inside the mouse silhouette.
+            if (percent > 0)
             {
-                new Point(19, 3), new Point(13, 15), new Point(18, 15),
-                new Point(15, 29), new Point(25, 12), new Point(20, 12)
-            };
-            using (Brush boltBrush = new SolidBrush(Color.White))
-                graphics.FillPolygon(boltBrush, bolt);
+                GraphicsState saved = graphics.Save();
+                graphics.SetClip(mousePath);
+                float fillH = Math.Max(h * 0.12f, h * (percent / 100f));
+                float fillTop = y + h - fillH;
+                RectangleF fillRect = new RectangleF(x, fillTop, w, fillH + 0.5f);
+                using (Brush fillBrush = new SolidBrush(Color.FromArgb(228, accent)))
+                    graphics.FillRectangle(fillBrush, fillRect);
+                graphics.Restore(saved);
+            }
+
+            float strokeWidth = Math.Max(1.25f, w * 0.095f);
+            using (Pen borderPen = new Pen(strokeColor, strokeWidth))
+                graphics.DrawPath(borderPen, mousePath);
         }
-        else if (percent < 10)
+
+        // Crisp vertical scroll wheel; white when submerged in liquid, dark/light contrast when above liquid.
+        float wheelW = Math.Max(2.0f, w * 0.17f);
+        float wheelH = Math.Max(3.6f, h * 0.22f);
+        float wheelX = x + (w - wheelW) / 2f;
+        float wheelY = y + h * 0.17f;
+        bool wheelSubmerged = percent >= 72;
+        Color wheelColor = wheelSubmerged
+            ? Color.White
+            : (percent < 0 ? Color.FromArgb(160, fg) : (critical ? accent : Color.FromArgb(220, fg)));
+
+        RectangleF wheelRect = new RectangleF(wheelX, wheelY, wheelW, wheelH);
+        using (GraphicsPath wheelPath = RoundedRectangle(wheelRect, wheelW / 2f))
+        using (Brush wheelBrush = new SolidBrush(wheelColor))
+            graphics.FillPath(wheelBrush, wheelPath);
+
+        // Non-overlapping miniature lightning bolt badge at bottom-right while charging.
+        if (charging)
         {
-            using (Font font = new Font("Segoe UI", 17f, FontStyle.Bold, GraphicsUnit.Pixel))
-                TextRenderer.DrawText(graphics, "!", font, new Rectangle(9, 4, 12, 24), Color.White,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            float boltH = Math.Max(7.5f, h * 0.42f);
+            Color haloColor = lightTaskbar
+                ? Color.FromArgb(220, 242, 244, 248)
+                : Color.FromArgb(220, 24, 28, 34);
+            DrawMiniBolt(graphics, x + w - 0.5f, y + h - boltH * 0.38f, boltH, haloColor, accent);
         }
     }
 
-    private static GraphicsPath RoundedRectangle(Rectangle bounds, int radius)
+    public static void DrawMiniBolt(Graphics graphics, float cx, float cy, float h, Color haloColor, Color boltColor)
+    {
+        float w = h * 0.65f;
+        float x = cx - w / 2f;
+        float y = cy - h / 2f;
+        PointF[] pts =
+        {
+            new PointF(x + w * 0.62f, y),
+            new PointF(x + w * 0.05f, y + h * 0.55f),
+            new PointF(x + w * 0.48f, y + h * 0.55f),
+            new PointF(x + w * 0.34f, y + h),
+            new PointF(x + w * 0.96f, y + h * 0.44f),
+            new PointF(x + w * 0.54f, y + h * 0.44f)
+        };
+        if (haloColor.A > 0)
+        {
+            using (Pen haloPen = new Pen(haloColor, Math.Max(1.6f, h * 0.22f)))
+            {
+                haloPen.LineJoin = LineJoin.Round;
+                graphics.DrawPolygon(haloPen, pts);
+            }
+        }
+        using (Brush boltBrush = new SolidBrush(boltColor))
+            graphics.FillPolygon(boltBrush, pts);
+    }
+
+    public static Color GetStatusColor(int percent, bool charging, bool lightTaskbar, int lowBatteryThreshold)
+    {
+        if (percent < 0)
+            return lightTaskbar ? Color.FromArgb(100, 116, 139) : Color.FromArgb(148, 163, 184);
+        if (charging)
+            return lightTaskbar ? Color.FromArgb(2, 132, 199) : Color.FromArgb(56, 189, 248);
+        if (IsCriticalLevel(percent, charging, lowBatteryThreshold))
+            return lightTaskbar ? Color.FromArgb(220, 38, 38) : Color.FromArgb(248, 113, 113);
+        if (percent < 30)
+            return lightTaskbar ? Color.FromArgb(217, 119, 6) : Color.FromArgb(251, 146, 60);
+        if (percent < 50)
+            return lightTaskbar ? Color.FromArgb(202, 138, 4) : Color.FromArgb(250, 204, 21);
+        return lightTaskbar ? Color.FromArgb(16, 163, 95) : Color.FromArgb(52, 211, 153);
+    }
+
+    public static bool IsSystemLightTaskbar()
+    {
+        try
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", false))
+            {
+                if (key == null)
+                    return false;
+                object val = key.GetValue("SystemUsesLightTheme");
+                return val != null && Convert.ToInt32(val) != 0;
+            }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    public static GraphicsPath RoundedRectangle(RectangleF bounds, float radius)
     {
         GraphicsPath path = new GraphicsPath();
-        int diameter = radius * 2;
+        float diameter = radius * 2f;
+        if (diameter > bounds.Width)
+            diameter = bounds.Width;
+        if (diameter > bounds.Height)
+            diameter = bounds.Height;
+        if (diameter <= 0.1f)
+        {
+            path.AddRectangle(bounds);
+            return path;
+        }
+
         path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
         path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
         path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
         path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure();
         return path;
+    }
+}
+
+internal sealed class TaskbarBatteryWidget : Form
+{
+    private const int WsExLayered = 0x00080000;
+    private const int WsExToolWindow = 0x00000080;
+    private const int WsExNoActivate = 0x08000000;
+    private const int WsExTopMost = 0x00000008;
+    private const int WmMouseActivate = 0x0021;
+    private const int MaNoActivate = 3;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoActivate = 0x0010;
+    private const uint SwpShowWindow = 0x0040;
+    private const uint GwHwndPrev = 3;
+    private const byte AcSrcOver = 0x00;
+    private const byte AcSrcAlpha = 0x01;
+    private const int UlwAlpha = 0x02;
+    private const int QunsBusy = 2;
+    private const int QunsRunningD3DFullScreen = 3;
+    private const int QunsPresentationMode = 4;
+    private static readonly IntPtr HwndTopMost = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+
+        public int Width { get { return Right - Left; } }
+        public int Height { get { return Bottom - Top; } }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+
+        public POINT(int x, int y)
+        {
+            X = x;
+            Y = y;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SIZE
+    {
+        public int Width;
+        public int Height;
+
+        public SIZE(int width, int height)
+        {
+            Width = width;
+            Height = height;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct BLENDFUNCTION
+    {
+        public byte BlendOp;
+        public byte BlendFlags;
+        public byte SourceConstantAlpha;
+        public byte AlphaFormat;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string className, string windowName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter,
+        string className, string windowTitle);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+        int x, int y, int cx, int cy, uint flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst,
+        ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteDC(IntPtr hDC);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObject);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHQueryUserNotificationState(out int pquns);
+
+    private readonly ContextMenuStrip trayMenu;
+    private readonly ToolTip hoverTip;
+    private readonly Timer dockTimer;
+    private int currentPercent = -1;
+    private bool currentCharging;
+    private int lowBatteryThresholdPercent = 10;
+    private bool hovered;
+    private bool lightTaskbar;
+    private bool closingForExit;
+    private bool visuallyDirty = true;
+    private Rectangle lastDockedBounds = Rectangle.Empty;
+
+    public event EventHandler StatusRequested;
+
+    public TaskbarBatteryWidget(ContextMenuStrip contextMenu)
+    {
+        trayMenu = contextMenu;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        Size = new Size(36, 36);
+        lightTaskbar = TrayIconFactory.IsSystemLightTaskbar();
+
+        hoverTip = new ToolTip();
+        hoverTip.InitialDelay = 300;
+        hoverTip.ReshowDelay = 150;
+        hoverTip.AutoPopDelay = 8000;
+        hoverTip.ShowAlways = true;
+
+        dockTimer = new Timer();
+        dockTimer.Interval = 250;
+        dockTimer.Tick += delegate { SyncWithTaskbar(); };
+    }
+
+    protected override bool ShowWithoutActivation
+    {
+        get { return true; }
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= WsExLayered | WsExToolWindow | WsExNoActivate | WsExTopMost;
+            return cp;
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WmMouseActivate)
+        {
+            m.Result = new IntPtr(MaNoActivate);
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    public void StartDocking()
+    {
+        CreateHandle();
+        SyncWithTaskbar();
+        dockTimer.Start();
+    }
+
+    public void SetLowBatteryThreshold(int thresholdPercent)
+    {
+        int clamped = AlertSettings.ClampThreshold(thresholdPercent);
+        if (lowBatteryThresholdPercent != clamped)
+        {
+            lowBatteryThresholdPercent = clamped;
+            visuallyDirty = true;
+            if (Visible)
+                RenderLayeredBitmap();
+        }
+    }
+
+    public void SetReading(int percent, bool charging, string tooltipText)
+    {
+        int clamped = Math.Max(0, Math.Min(100, percent));
+        if (currentPercent != clamped || currentCharging != charging)
+        {
+            currentPercent = clamped;
+            currentCharging = charging;
+            visuallyDirty = true;
+            SyncWithTaskbar();
+            if (Visible && visuallyDirty)
+                RenderLayeredBitmap();
+        }
+        UpdateTooltip(tooltipText);
+    }
+
+    public void SetUnknown(string tooltipText)
+    {
+        if (currentPercent != -1 || currentCharging)
+        {
+            currentPercent = -1;
+            currentCharging = false;
+            visuallyDirty = true;
+            SyncWithTaskbar();
+            if (Visible && visuallyDirty)
+                RenderLayeredBitmap();
+        }
+        UpdateTooltip(tooltipText);
+    }
+
+    public void RefreshAppearance()
+    {
+        lightTaskbar = TrayIconFactory.IsSystemLightTaskbar();
+        visuallyDirty = true;
+        SyncWithTaskbar();
+        if (Visible)
+            RenderLayeredBitmap();
+    }
+
+    public void CloseForExit()
+    {
+        closingForExit = true;
+        dockTimer.Stop();
+        Close();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            dockTimer.Dispose();
+            hoverTip.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!closingForExit && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            return;
+        }
+        base.OnFormClosing(e);
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        base.OnMouseEnter(e);
+        if (!hovered)
+        {
+            hovered = true;
+            visuallyDirty = true;
+            RenderLayeredBitmap();
+        }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (hovered)
+        {
+            hovered = false;
+            visuallyDirty = true;
+            RenderLayeredBitmap();
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button == MouseButtons.Right && trayMenu != null)
+        {
+            // Activate our hidden message owner momentarily so clicking outside closes the popup menu.
+            SetForegroundWindow(Handle);
+            trayMenu.Show(Cursor.Position);
+        }
+    }
+
+    protected override void OnMouseDoubleClick(MouseEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        if (e.Button == MouseButtons.Left)
+        {
+            EventHandler handler = StatusRequested;
+            if (handler != null)
+                handler(this, EventArgs.Empty);
+        }
+    }
+
+    private void UpdateTooltip(string text)
+    {
+        if (IsDisposed)
+            return;
+        hoverTip.SetToolTip(this, string.IsNullOrEmpty(text) ? "红龙G49 PRO鼠标电量助手" : text);
+    }
+
+    private void SyncWithTaskbar()
+    {
+        if (closingForExit || IsDisposed)
+            return;
+
+        IntPtr shellTray = FindWindow("Shell_TrayWnd", null);
+        if (shellTray == IntPtr.Zero || !IsWindowVisible(shellTray))
+        {
+            HideWidget();
+            return;
+        }
+
+        RECT trayRect;
+        if (!GetWindowRect(shellTray, out trayRect) || trayRect.Width <= 0 || trayRect.Height <= 0)
+        {
+            HideWidget();
+            return;
+        }
+
+        Screen taskbarScreen = Screen.FromRectangle(
+            new Rectangle(trayRect.Left, trayRect.Top, trayRect.Width, trayRect.Height));
+        if (!IsTaskbarVisibleOnScreen(trayRect, taskbarScreen.Bounds) || IsFullscreenAppActive(shellTray, taskbarScreen.Bounds))
+        {
+            HideWidget();
+            return;
+        }
+
+        IntPtr trayNotify = FindWindowEx(shellTray, IntPtr.Zero, "TrayNotifyWnd", null);
+        RECT notifyRect = new RECT();
+        bool hasNotify = trayNotify != IntPtr.Zero &&
+                         GetWindowRect(trayNotify, out notifyRect) &&
+                         notifyRect.Width > 0 && notifyRect.Height > 0;
+
+        bool horizontal = trayRect.Width >= trayRect.Height;
+        int targetW;
+        int targetH;
+        int targetX;
+        int targetY;
+
+        if (horizontal)
+        {
+            int barH = trayRect.Height;
+            targetH = Math.Max(28, (int)Math.Round(barH * 0.76));
+            targetW = MeasureHorizontalWidgetWidth(barH);
+            int gap = Math.Max(2, (int)Math.Round(barH * 0.04));
+            int anchorRight = hasNotify ? notifyRect.Left : (trayRect.Right - barH * 3);
+            targetX = Math.Max(trayRect.Left + 8, anchorRight - targetW - gap);
+            targetY = trayRect.Top + (barH - targetH) / 2;
+        }
+        else
+        {
+            int barW = trayRect.Width;
+            targetW = Math.Max(30, (int)Math.Round(barW * 0.84));
+            targetH = Math.Max(38, (int)Math.Round(barW * 0.84));
+            int gap = Math.Max(2, (int)Math.Round(barW * 0.06));
+            int anchorBottom = hasNotify ? notifyRect.Top : (trayRect.Bottom - barW * 3);
+            targetX = trayRect.Left + (barW - targetW) / 2;
+            targetY = Math.Max(trayRect.Top + 8, anchorBottom - targetH - gap);
+        }
+
+        Rectangle targetBounds = new Rectangle(targetX, targetY, targetW, targetH);
+        bool boundsChanged = targetBounds != lastDockedBounds;
+        bool sizeChanged = targetW != lastDockedBounds.Width || targetH != lastDockedBounds.Height;
+
+        if (sizeChanged)
+            visuallyDirty = true;
+
+        lastDockedBounds = targetBounds;
+
+        if (!Visible)
+        {
+            Bounds = targetBounds;
+            Show();
+            visuallyDirty = true;
+            RenderLayeredBitmap();
+            SetWindowPos(Handle, HwndTopMost, targetX, targetY, targetW, targetH,
+                SwpNoActivate | SwpShowWindow);
+            return;
+        }
+
+        if (visuallyDirty)
+        {
+            if (sizeChanged)
+                Size = new Size(targetW, targetH);
+            RenderLayeredBitmap();
+        }
+
+        if (boundsChanged)
+        {
+            SetWindowPos(Handle, HwndTopMost, targetX, targetY, targetW, targetH,
+                SwpNoActivate | SwpShowWindow);
+        }
+        else if (IsWindowAboveUs(shellTray))
+        {
+            SetWindowPos(Handle, HwndTopMost, 0, 0, 0, 0,
+                SwpNoActivate | SwpNoMove | SwpNoSize | SwpShowWindow);
+        }
+    }
+
+    private void HideWidget()
+    {
+        if (Visible)
+        {
+            hovered = false;
+            Hide();
+        }
+    }
+
+    private bool IsWindowAboveUs(IntPtr otherHandle)
+    {
+        IntPtr cursor = GetWindow(Handle, GwHwndPrev);
+        int guard = 0;
+        while (cursor != IntPtr.Zero && guard < 25)
+        {
+            if (cursor == otherHandle)
+                return true;
+            cursor = GetWindow(cursor, GwHwndPrev);
+            guard++;
+        }
+        return false;
+    }
+
+    private static bool IsTaskbarVisibleOnScreen(RECT trayRect, Rectangle screenBounds)
+    {
+        Rectangle tray = new Rectangle(trayRect.Left, trayRect.Top, trayRect.Width, trayRect.Height);
+        Rectangle visiblePart = Rectangle.Intersect(tray, screenBounds);
+        return visiblePart.Width >= 16 && visiblePart.Height >= 16;
+    }
+
+    private bool IsFullscreenAppActive(IntPtr shellTray, Rectangle screenBounds)
+    {
+        try
+        {
+            int state;
+            if (SHQueryUserNotificationState(out state) == 0)
+            {
+                if (state == QunsBusy || state == QunsRunningD3DFullScreen || state == QunsPresentationMode)
+                    return true;
+            }
+        }
+        catch (Exception)
+        {
+        }
+
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero || foreground == Handle || foreground == shellTray || !IsWindowVisible(foreground))
+            return false;
+
+        string cls = GetWindowClassName(foreground);
+        if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(cls, "Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        RECT fgRect;
+        if (!GetWindowRect(foreground, out fgRect))
+            return false;
+
+        return fgRect.Left <= screenBounds.Left + 1 &&
+               fgRect.Top <= screenBounds.Top + 1 &&
+               fgRect.Right >= screenBounds.Right - 1 &&
+               fgRect.Bottom >= screenBounds.Bottom - 1;
+    }
+
+    private static string GetWindowClassName(IntPtr hWnd)
+    {
+        StringBuilder sb = new StringBuilder(128);
+        int len = GetClassName(hWnd, sb, sb.Capacity);
+        return len > 0 ? sb.ToString(0, len) : "";
+    }
+
+    private string FormatDisplayText()
+    {
+        return currentPercent < 0 ? "--" : (currentPercent.ToString() + "%");
+    }
+
+    private int MeasureHorizontalWidgetWidth(int barHeight)
+    {
+        float mouseH = Math.Max(16f, barHeight * 0.365f);
+        float mouseW = mouseH * 0.66f;
+        float fontPx = Math.Max(11.5f, barHeight * 0.22f);
+        float gap = Math.Max(4.5f, barHeight * 0.095f);
+        float padX = Math.Max(6.5f, barHeight * 0.145f);
+        string text = FormatDisplayText();
+
+        using (Bitmap probe = new Bitmap(1, 1, PixelFormat.Format32bppPArgb))
+        using (Graphics g = Graphics.FromImage(probe))
+        using (Font font = new Font("Segoe UI", fontPx, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (StringFormat fmt = new StringFormat(StringFormat.GenericTypographic))
+        {
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            fmt.FormatFlags |= StringFormatFlags.NoClip;
+            SizeF textSize = g.MeasureString(text, font, 200, fmt);
+            return (int)Math.Ceiling(padX + mouseW + gap + textSize.Width + padX);
+        }
+    }
+
+    private void RenderLayeredBitmap()
+    {
+        if (!IsHandleCreated || IsDisposed)
+            return;
+
+        int width = Math.Max(24, lastDockedBounds.Width > 0 ? lastDockedBounds.Width : Width);
+        int height = Math.Max(24, lastDockedBounds.Height > 0 ? lastDockedBounds.Height : Height);
+        bool horizontalLayout = width >= height;
+
+        using (Bitmap bitmap = new Bitmap(width, height, PixelFormat.Format32bppPArgb))
+        using (Graphics graphics = Graphics.FromImage(bitmap))
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            graphics.Clear(Color.Transparent);
+
+            // Fluent hover highlight matching Windows 11 taskbar buttons; 1/255 alpha keeps hit-testing active.
+            RectangleF hitTile = new RectangleF(1f, 1f, width - 2f, height - 2f);
+            float tileRadius = Math.Max(4f, Math.Min(width, height) * 0.14f);
+            using (GraphicsPath tilePath = TrayIconFactory.RoundedRectangle(hitTile, tileRadius))
+            {
+                Color hoverBg = hovered
+                    ? (lightTaskbar ? Color.FromArgb(22, 0, 0, 0) : Color.FromArgb(24, 255, 255, 255))
+                    : Color.FromArgb(1, 0, 0, 0);
+                using (Brush hoverBrush = new SolidBrush(hoverBg))
+                    graphics.FillPath(hoverBrush, tilePath);
+
+                if (hovered)
+                {
+                    Color hoverBorder = lightTaskbar
+                        ? Color.FromArgb(26, 0, 0, 0)
+                        : Color.FromArgb(28, 255, 255, 255);
+                    using (Pen hoverPen = new Pen(hoverBorder, 1f))
+                        graphics.DrawPath(hoverPen, tilePath);
+                }
+            }
+
+            Color fg = lightTaskbar ? Color.FromArgb(24, 26, 32) : Color.FromArgb(244, 246, 250);
+            Color accent = TrayIconFactory.GetStatusColor(currentPercent, currentCharging, lightTaskbar, lowBatteryThresholdPercent);
+            bool critical = TrayIconFactory.IsCriticalLevel(currentPercent, currentCharging, lowBatteryThresholdPercent);
+            Color textColor = critical ? accent : fg;
+            string text = FormatDisplayText();
+
+            if (horizontalLayout)
+            {
+                // Reverse-derive taskbar barHeight from tile height (targetH = barH * 0.76).
+                float barH = height / 0.76f;
+                float mouseH = Math.Max(16f, barH * 0.365f);
+                float mouseW = mouseH * 0.66f;
+                float fontPx = Math.Max(11.5f, barH * 0.22f);
+                float gap = Math.Max(4.5f, barH * 0.095f);
+
+                using (Font font = new Font("Segoe UI", fontPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (Brush textBrush = new SolidBrush(textColor))
+                using (StringFormat fmt = new StringFormat(StringFormat.GenericTypographic))
+                {
+                    fmt.FormatFlags |= StringFormatFlags.NoClip;
+                    SizeF textSize = graphics.MeasureString(text, font, 200, fmt);
+                    float contentW = mouseW + gap + textSize.Width;
+                    float startX = (width - contentW) / 2f;
+                    float centerY = height / 2f;
+
+                    TrayIconFactory.DrawLiquidMouse(graphics,
+                        startX, centerY - mouseH / 2f, mouseW, mouseH,
+                        currentPercent, currentCharging, lightTaskbar, lowBatteryThresholdPercent);
+
+                    graphics.DrawString(text, font, textBrush,
+                        startX + mouseW + gap, centerY - textSize.Height / 2f - 0.3f, fmt);
+                }
+            }
+            else
+            {
+                // Vertical taskbar fallback: liquid mouse centered on top, percentage underneath.
+                float mouseH = Math.Max(14f, height * 0.48f);
+                float mouseW = mouseH * 0.66f;
+                float mx = (width - mouseW) / 2f;
+                float my = height * 0.10f;
+                TrayIconFactory.DrawLiquidMouse(graphics, mx, my, mouseW, mouseH,
+                    currentPercent, currentCharging, lightTaskbar, lowBatteryThresholdPercent);
+
+                float fontPx = Math.Max(10f, width * 0.26f);
+                using (Font font = new Font("Segoe UI", fontPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (Brush textBrush = new SolidBrush(textColor))
+                using (StringFormat fmt = new StringFormat(StringFormat.GenericTypographic))
+                {
+                    fmt.Alignment = StringAlignment.Center;
+                    fmt.LineAlignment = StringAlignment.Center;
+                    fmt.FormatFlags |= StringFormatFlags.NoClip;
+                    graphics.DrawString(text, font, textBrush,
+                        new RectangleF(0f, my + mouseH + 1f, width, height - (my + mouseH + 2f)), fmt);
+                }
+            }
+
+            ApplyLayeredBitmap(bitmap, width, height);
+        }
+
+        visuallyDirty = false;
+    }
+
+    private void ApplyLayeredBitmap(Bitmap bitmap, int width, int height)
+    {
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero)
+            return;
+
+        IntPtr memDc = IntPtr.Zero;
+        IntPtr hBitmap = IntPtr.Zero;
+        IntPtr oldBitmap = IntPtr.Zero;
+        try
+        {
+            memDc = CreateCompatibleDC(screenDc);
+            hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
+            oldBitmap = SelectObject(memDc, hBitmap);
+
+            POINT destPoint = new POINT(
+                lastDockedBounds.IsEmpty ? Left : lastDockedBounds.Left,
+                lastDockedBounds.IsEmpty ? Top : lastDockedBounds.Top);
+            SIZE bitmapSize = new SIZE(width, height);
+            POINT srcPoint = new POINT(0, 0);
+            BLENDFUNCTION blend = new BLENDFUNCTION
+            {
+                BlendOp = AcSrcOver,
+                BlendFlags = 0,
+                SourceConstantAlpha = 255,
+                AlphaFormat = AcSrcAlpha
+            };
+
+            UpdateLayeredWindow(Handle, screenDc, ref destPoint, ref bitmapSize,
+                memDc, ref srcPoint, 0, ref blend, UlwAlpha);
+        }
+        finally
+        {
+            if (oldBitmap != IntPtr.Zero && memDc != IntPtr.Zero)
+                SelectObject(memDc, oldBitmap);
+            if (hBitmap != IntPtr.Zero)
+                DeleteObject(hBitmap);
+            if (memDc != IntPtr.Zero)
+                DeleteDC(memDc);
+            ReleaseDC(IntPtr.Zero, screenDc);
+        }
     }
 }

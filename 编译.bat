@@ -11,7 +11,10 @@ if not exist "%CSC%" (
   exit /b 1
 )
 
-"%CSC%" /nologo /utf8output /target:winexe /out:"红龙G49 PRO鼠标电量助手.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll "G49电量助手.cs"
+set "ICON_ARG="
+if exist "app.ico" set "ICON_ARG=/win32icon:"app.ico""
+
+"%CSC%" /nologo /utf8output /target:winexe %ICON_ARG% /out:"红龙G49 PRO鼠标电量助手.exe" /r:System.Windows.Forms.dll /r:System.Drawing.dll "G49电量助手.cs"
 if errorlevel 1 (
   echo 编译失败。
   pause
